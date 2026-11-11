@@ -2,7 +2,7 @@ import express from 'express';
 import { fromNodeHeaders } from 'better-auth/node';
 import { z } from 'zod';
 import { db, transaction, audit } from './db.js';
-import { auth } from './auth.js';
+import { auth, mfaEnabled } from './auth.js';
 import { HttpError, transition } from './workflow.js';
 import { dashboardCounts, yearlyActivity } from './analytics.js';
 import { insertResidents, parseResidentCsv, previewResidents, residentCsvLimit, validateResident } from './residents.js';
@@ -38,7 +38,7 @@ api.use(async (req, res, next) => {
   if (employee && !employee.enabled) throw new HttpError(403, 'This employee account is disabled.');
   req.actor = {
     id: session.user.id, name: session.user.name, email: session.user.email,
-    role: employee?.role || 'resident', mfaRequired: Boolean(employee && !session.user.twoFactorEnabled),
+    role: employee?.role || 'resident', mfaRequired: Boolean(mfaEnabled && employee && !session.user.twoFactorEnabled),
     sessionId: session.session.id,
   };
   if (req.actor.mfaRequired && !(req.method === 'GET' && req.path === '/me')) {
@@ -68,7 +68,7 @@ function mutate(work) {
         'SELECT 1 FROM session WHERE id = $1 AND "expiresAt" > now()', [req.actor.sessionId],
       );
       if (!session.rowCount || !current || (employee?.role || 'resident') !== req.actor.role ||
-          (employee && (!employee.enabled || !current.twoFactorEnabled))) {
+          (employee && (!employee.enabled || (mfaEnabled && !current.twoFactorEnabled)))) {
         throw new HttpError(401, 'Sign in again to continue.');
       }
       return work(req, client);

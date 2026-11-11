@@ -265,7 +265,7 @@ function Admin({ services, employees, audit, run }) {
       </details>)}
     </section>
     <section className="card"><h2>Employee access</h2>
-      <p>Reserve an approved email address, then have the employee register, verify the address, and enroll their authenticator.</p>
+      <p>Reserve an approved email address, then have the employee register, verify the address, and follow the sign-in prompts.</p>
       <Form submit="Save employee access" onSubmit={fields => run('/employees', 'PUT', { ...fields, enabled: fields.enabled === 'on' })}>
         <Field title="Approved employee email" type="email" name="email" />
         <label>Role<select name="role">{['staff', 'approver', 'treasurer', 'admin'].map(role => <option key={role} value={role}>{label(role)}</option>)}</select></label>

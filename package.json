@@ -6,7 +6,7 @@
     "node": ">=24 <25"
   },
   "scripts": {
-    "dev": "node --env-file-if-exists=.env --env-file-if-exists=.env.local backend/index.js",
+    "dev": "node --env-file-if-exists=.env --env-file-if-exists=.env.local backend/index.js --local-dev",
     "build": "next build frontend --webpack",
     "start": "node --env-file-if-exists=.env backend/index.js --production",
     "db:migrate": "node --env-file-if-exists=.env --env-file-if-exists=.env.local scripts/migrate.js",
