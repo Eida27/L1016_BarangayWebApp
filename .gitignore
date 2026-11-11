@@ -1,0 +1,21 @@
+# Dependencies and package manager caches
+node_modules/
+.npm/
+
+# Next.js build output
+.next/
+out/
+next-env.d.ts
+
+# Environment files and local services
+.env*
+!.env.example
+.local/
+
+# Test output and logs
+coverage/
+*.log
+
+# Operating system files
+.DS_Store
+Thumbs.db
