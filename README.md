@@ -20,9 +20,21 @@ Express serves both the API and the Next.js frontend on the same origin. Run the
 
 The service catalog starts disabled. Confirm the official requirements, fees, and authorization procedures before publishing it. A request keeps the fee configured when it was submitted. Assisted filing supports residents without an online account. Staff communicate updates to those residents using the existing counter process.
 
+## Employee workspace
+
+- **Admin and barangay captain** can view the dashboard and yearly reports, import resident CSV files, manage service settings and employee access, and inspect audit history. The captain uses the existing `approver` role and can also approve or reject reviewed requests.
+- **Barangay staff** can view the dashboard, register walk-ins, review and decide eligible document requests, and manage the counter and pickup workflow. Staff confirm eligibility before a request enters Awaiting approval. A final rejection requires a reason.
+- **Dashboard** counts official register entries, regardless of portal accounts. A request stays pending through review, approval, and pickup preparation. Released and rejected requests are resolved. Yearly reports use the Manila calendar and count registrations, submissions, releases, and rejections when they occurred.
+
+### Import the resident register
+
+Download the template from **Import Residents**. Save the file as UTF-8 CSV with the headers `name,contact_number,age,sex`. Keep contact numbers formatted as text to preserve leading zeros. Enter age in whole years from 0 to 130. Accepted sex values are `female`, `male`, `other`, and `undisclosed`. The CSV also accepts `F` and `M`.
+
+Preview up to 5,000 data rows and 2 MiB, correct invalid rows, then confirm. The system skips repeated entries with the same normalized name and phone number. Matching ignores name case, repeated spaces, and phone punctuation, and treats Philippine mobile numbers starting with `+63` and `09` as equivalent. Existing entries are kept. Walk-in and CSV registrations count immediately after saving.
+
 ## Verification
 
-- `npm test` checks the workflow transition rules.
+- `npm test` checks workflow transitions and CSV validation.
 - `npm run build` compiles the production frontend.
 - `npm run test:integration` exercises HTTP routes against an **empty disposable database** with synthetic data. Set `TEST_DATABASE_URL` to the disposable database owner URL. The test migrates the database, starts a local SMTP catcher and Next/Express server, and leaves its test records for inspection. Use a new database for each run.
 

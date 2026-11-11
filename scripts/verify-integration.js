@@ -54,8 +54,8 @@ function browser() {
     const response = await fetch(origin + '/api/v1' + path, {
       method, redirect: 'manual', headers: {
         Origin: requestOrigin, 'X-Forwarded-For': forwardedFor, Cookie: [...cookies].map(pair => pair.join('=')).join('; '),
-        ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
-      }, body: body === undefined ? undefined : JSON.stringify(body),
+        ...(body === undefined ? {} : { 'Content-Type': typeof body === 'string' ? 'text/csv' : 'application/json' }),
+      }, body: typeof body === 'string' ? body : body === undefined ? undefined : JSON.stringify(body),
     });
     for (const raw of response.headers.getSetCookie()) {
       const [name, ...parts] = raw.split(';')[0].split('=');
@@ -98,6 +98,7 @@ async function register(name, role) {
   if (role !== 'resident') {
     assert.equal((await send('/me')).mfaRequired, true);
     await send('/services', 'GET', undefined, 403);
+    await send('/dashboard', 'GET', undefined, 403);
     const older = browser();
     await older('/auth/sign-in/email', 'POST', { email, password });
     const { totpURI } = await send('/auth/two-factor/enable', 'POST', { password });
@@ -157,6 +158,43 @@ try {
   const resident = await register('resident', 'resident');
   const neighbor = await register('neighbor', 'resident');
   const fields = { applicant: 'Sample Applicant', address: '1 Sample Street', purpose: 'Integration test' };
+  const registration = { name: 'Sample Walk-In', contactNumber: '09123456789', age: '20', sex: 'female' };
+  const csvHeader = 'name,contact_number,age,sex\r\n';
+  const csv = csvHeader + 'sample walk-in,+639123456789,20,F\r\n"Example, Sam",01234567890,21,M\r\n';
+  const preview = '/residents/import?mode=preview';
+  const commit = '/residents/import?mode=commit';
+  const captain = await approver('/me');
+  assert.equal(captain.role, 'approver');
+  assert.deepEqual(await approver('/employees'), await admin('/employees'));
+  await approver('/employees', 'PUT', { email: 'temporary@example.test', role: 'staff', enabled: false });
+  await approver('/employees', 'PUT', { email: 'approver@example.test', role: 'admin', enabled: true }, 409);
+  await approver('/services/residency', 'PUT', { instructions: 'Verify residency at the counter.', fee: 0, enabled: false });
+  assert.equal((await approver('/services')).find(service => service.id === 'residency').enabled, false);
+  assert.equal((await staff('/services')).some(service => service.id === 'residency'), false);
+  await approver('/services/residency', 'PUT', { instructions: 'Verify residency at the counter.', fee: 0, enabled: true });
+  assert.ok((await approver('/audit')).some(event => event.action === 'service_configured' && event.actor_id === captain.id));
+  await staff('/employees', 'GET', undefined, 403);
+  await admin('/requests', 'GET', undefined, 403);
+  await resident('/dashboard', 'GET', undefined, 403);
+  await treasurer('/dashboard', 'GET', undefined, 403);
+  await staff('/reports/yearly', 'GET', undefined, 403);
+  await staff(preview, 'POST', csv, 403);
+  await treasurer(commit, 'POST', csv, 403);
+  await approver('/residents', 'POST', registration, 403);
+  await admin('/residents', 'POST', registration, 403);
+  const walkIn = await staff('/residents', 'POST', registration);
+  await staff('/residents', 'POST', registration, 409);
+  assert.deepEqual(await approver(preview, 'POST', csv), { ready: 1, errors: [], duplicateRows: [2] });
+  const invalid = csv + 'Invalid,abc,21,M';
+  const invalidPreview = await admin(preview, 'POST', invalid);
+  assert.equal(invalidPreview.errors[0].row, 4);
+  await admin(commit, 'POST', invalid, 400);
+  assert.equal((await staff('/dashboard')).residents, 1);
+  const imports = await Promise.all([approver(commit, 'POST', csv), admin(commit, 'POST', csv)]);
+  assert.deepEqual(imports.map(result => result.inserted).sort(), [0, 1]);
+  assert.deepEqual(await admin(commit, 'POST', csv), { inserted: 0, duplicateRows: [2, 3] });
+  assert.equal((await client.query("SELECT contact_number FROM resident_register WHERE source='csv'")).rows[0].contact_number, '01234567890');
+  assert.deepEqual(await approver('/dashboard'), { residents: 2, pending: 0, resolved: 0, released: 0, rejected: 0 });
   await resident('/requests', 'POST', { ...fields, service: 'clearance' }, 403, 'https://invalid.example');
   const first = '/requests/' + (await resident('/requests', 'POST', { ...fields, service: 'clearance' })).id;
   const second = '/requests/' + (await neighbor('/requests', 'POST', { ...fields, service: 'residency' })).id;
@@ -168,16 +206,18 @@ try {
   await action(resident, first, 'resubmit', fields);
   await action(staff, first, 'forward', {}, 400);
   await action(staff, first, 'forward', { verified: true });
-  await action(staff, first, 'approve', {}, 403);
   await action(admin, first, 'approve', {}, 403);
-  await action(approver, first, 'approve');
+  const approvals = await Promise.allSettled([action(staff, first, 'approve'), action(approver, first, 'approve')]);
+  assert.equal(approvals.filter(result => result.status === 'fulfilled').length, 1);
+  assert.match(approvals.find(result => result.status === 'rejected').reason.message, /no longer in the required status/);
+  assert.equal((await admin('/dashboard')).pending, 2);
   await action(staff, first, 'ready');
   await action(staff, first, 'release', {}, 409);
   await treasurer(first + '/payment', 'POST', { centavos: 5000, reference: 'OR-TEST-1' });
   await treasurer(first + '/payment', 'POST', { centavos: 5000, reference: 'OR-TEST-1' }, 409);
   await action(staff, second, 'review');
   await action(staff, second, 'forward', { verified: true });
-  await action(approver, second, 'approve');
+  await action(staff, second, 'approve');
   await action(staff, second, 'ready');
   const startsAt = new Date(Date.now() + 86_400_000).toISOString();
   const { id: slotId } = await staff('/slots', 'POST', { startsAt, capacity: 1 });
@@ -213,6 +253,7 @@ try {
   const refusal = '/requests/' + (await neighbor('/requests', 'POST', { ...fields, service: 'residency' })).id;
   await action(staff, refusal, 'review');
   await action(staff, refusal, 'forward', { verified: true });
+  await action(staff, refusal, 'reject', {}, 400);
   await action(approver, refusal, 'reject', { reason: 'Synthetic approval refusal.' });
   assert.ok((await neighbor('/requests')).some(row => row.status === 'rejected' && row.reason === 'Synthetic approval refusal.'));
 
@@ -223,10 +264,31 @@ try {
   await client.query("UPDATE requests SET created_at='2030-01-01T16:00:00Z' WHERE id=$1", [second.split('/').at(-1)]);
   assert.deepEqual(await staff('/reports?from=2030-01-01&to=2030-01-01'), [{ service: 'Barangay clearance', status: 'rejected', total: 1 }]);
   assert.deepEqual(await staff('/reports?from=2030-01-02&to=2030-01-02'), [{ service: 'Certificate of residency', status: 'released', total: 1 }]);
+  for (const status of ['submitted', 'under_review', 'needs_correction', 'awaiting_approval', 'approved', 'ready']) {
+    await client.query("INSERT INTO requests (service_id, applicant, address, purpose, fee_centavos, status) VALUES ('clearance','Fixture','Fixture','Fixture',0,$1)", [status]);
+  }
+  assert.deepEqual(await staff('/dashboard'), { residents: 2, pending: 6, resolved: 4, released: 2, rejected: 2 });
+
+  const firstId = first.split('/').at(-1);
+  await client.query("UPDATE requests SET created_at='2029-12-31T15:59:59Z', released_at='2029-12-31T16:00:00Z' WHERE id=$1", [firstId]);
+  await client.query("UPDATE request_history SET at='2029-12-31T16:00:00Z' WHERE request_id=$1 AND status='released'", [firstId]);
+  await client.query("UPDATE request_history SET at='2030-01-31T16:00:00Z' WHERE request_id=$1 AND status='rejected'", [refusal.split('/').at(-1)]);
+  await client.query("UPDATE resident_register SET registered_at='2029-12-31T16:00:00Z' WHERE id=$1", [walkIn.id]);
+  const priorYear = await admin('/reports/yearly?year=2029');
+  const yearly = await approver('/reports/yearly?year=2030');
+  const service = (month, id) => month.services.find(entry => entry.id === id);
+  assert.equal(yearly.months.length, 12);
+  assert.deepEqual(service(priorYear.months[11], 'clearance'), { id: 'clearance', received: 1, released: 0, rejected: 0 });
+  assert.deepEqual(service(yearly.months[0], 'clearance'), { id: 'clearance', received: 1, released: 1, rejected: 0 });
+  assert.equal(service(yearly.months[1], 'residency').rejected, 1);
+  assert.deepEqual(yearly.totals.registrations, { walkIn: 1, csv: 0 });
+  assert.deepEqual(service(yearly.totals, 'residency'), { id: 'residency', received: 1, released: 0, rejected: 1 });
   await admin('/employees', 'PUT', { email: 'staff@example.test', role: 'staff', enabled: false });
   await staff('/me', 'GET', undefined, 401);
   const events = await admin('/audit');
   assert.ok(events.some(event => event.action === 'request_released'));
+  assert.ok(events.some(event => event.action === 'resident_csv_import' && event.entity === 'resident_register'));
+  assert.ok(events.some(event => event.action === 'request_rejected' && event.actor_id === captain.id));
   assert.ok(events.some(event => event.action === 'sign_in' && event.outcome === 'denied'));
   await assert.rejects(client.query('DELETE FROM audit_events'), /append-only/);
   console.log('Passed HTTP integration: email, MFA, roles, requests, fees, concurrent booking, queues, reports and audit.');

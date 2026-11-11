@@ -4,6 +4,8 @@ import { z } from 'zod';
 import { db, transaction, audit } from './db.js';
 import { auth } from './auth.js';
 import { HttpError, transition } from './workflow.js';
+import { dashboardCounts, yearlyActivity } from './analytics.js';
+import { insertResidents, parseResidentCsv, previewResidents, residentCsvLimit, validateResident } from './residents.js';
 
 export const api = express.Router();
 const today = "(now() AT TIME ZONE 'Asia/Manila')::date";
@@ -11,6 +13,7 @@ const text = (max) => z.string().trim().min(1).max(max);
 const uuid = z.uuid();
 const amount = z.number().int().min(0).max(10_000_000);
 const employeeRoles = ['admin', 'staff', 'approver', 'treasurer'];
+const adminRoles = ['admin', 'approver'];
 const application = z.object({ applicant: text(120), address: text(300), purpose: text(300) });
 const submission = application.extend({ service: z.enum(['clearance', 'residency']) });
 const statusLabels = {
@@ -96,10 +99,10 @@ async function notify(client, request, message) {
 }
 
 api.get('/services', async (req, res) => {
-  res.json((await db.query('SELECT * FROM services WHERE enabled OR $1 ORDER BY name', [req.actor.role === 'admin'])).rows);
+  res.json((await db.query('SELECT * FROM services WHERE enabled OR $1 ORDER BY name', [adminRoles.includes(req.actor.role)])).rows);
 });
 api.put('/services/:id', mutate(async (req, client) => {
-  role(req, 'admin');
+  role(req, ...adminRoles);
   const { instructions, fee, enabled } = z.object({ instructions: text(1500), fee: amount, enabled: z.boolean() }).parse(req.body);
   const result = await client.query('UPDATE services SET instructions=$1, fee_centavos=$2, enabled=$3 WHERE id=$4',
     [instructions, fee, enabled, req.params.id]);
@@ -322,6 +325,50 @@ api.post('/notifications/:id/read', mutate(async (req, client) => {
   const id = z.string().regex(/^\d{1,18}$/).parse(req.params.id);
   await client.query('UPDATE notifications SET read_at=COALESCE(read_at,now()) WHERE id=$1 AND resident_id=$2', [id, req.actor.id]);
 }));
+api.get('/dashboard', async (req, res) => {
+  role(req, ...adminRoles, 'staff');
+  res.json(await dashboardCounts(db));
+});
+
+api.get('/reports/yearly', async (req, res) => {
+  role(req, ...adminRoles);
+  const currentYear = Number(new Intl.DateTimeFormat('en-PH', { year: 'numeric', timeZone: 'Asia/Manila' }).format());
+  const year = z.coerce.number().int().min(1900).max(9998).parse(req.query.year ?? currentYear);
+  res.json(await yearlyActivity(db, year));
+});
+
+api.post('/residents', mutate(async (req, client) => {
+  role(req, 'staff');
+  const [resident] = await insertResidents(client, [validateResident(req.body)], 'walk_in');
+  if (!resident) throw new HttpError(409, 'A resident with that name and contact number is already registered.');
+  await audit(client, req.actor.id, 'resident_registered', 'resident', resident.id);
+  return { id: resident.id };
+}));
+
+api.post('/residents/import', (req, res, next) => {
+  role(req, ...adminRoles);
+  next();
+}, express.raw({ type: 'text/csv', limit: residentCsvLimit }), async (req, res) => {
+  const mode = z.enum(['preview', 'commit']).parse(req.query.mode);
+  const { rows, errors, duplicateRows } = parseResidentCsv(req.body);
+  if (mode === 'preview') {
+    const existingRows = await previewResidents(db, rows);
+    duplicateRows.push(...existingRows);
+    return res.json({
+      ready: rows.length - existingRows.length,
+      errors, duplicateRows: duplicateRows.sort((a, b) => a - b),
+    });
+  }
+  if (errors.length) return res.status(400).json({ error: 'Correct the invalid CSV rows and preview the file again.', errors });
+  return mutate(async (req, client) => {
+    const inserted = await insertResidents(client, rows, 'csv');
+    const keys = new Set(inserted.map(record => JSON.stringify([record.name_key, record.contact_key])));
+    duplicateRows.push(...rows.filter(row => !keys.has(JSON.stringify([row.nameKey, row.contactKey]))).map(row => row.row));
+    await audit(client, req.actor.id, 'resident_csv_import', 'resident_register', 'batch', inserted.length ? 'success' : 'no_changes');
+    return { inserted: inserted.length, duplicateRows: duplicateRows.sort((a, b) => a - b) };
+  })(req, res);
+});
+
 api.get('/reports', async (req, res) => {
   role(req, ...employeeRoles);
   const { from, to } = z.object({ from: z.iso.date(), to: z.iso.date() }).parse(req.query);
@@ -333,11 +380,11 @@ api.get('/reports', async (req, res) => {
     GROUP BY s.name,r.status ORDER BY s.name,r.status`, [from, to])).rows);
 });
 api.get('/employees', async (req, res) => {
-  role(req, 'admin');
+  role(req, ...adminRoles);
   res.json((await db.query('SELECT email, role, enabled FROM employee ORDER BY email')).rows);
 });
 api.put('/employees', mutate(async (req, client) => {
-  role(req, 'admin');
+  role(req, ...adminRoles);
   const data = z.object({ email: z.email().transform(v => v.toLowerCase()), role: z.enum(employeeRoles), enabled: z.boolean() }).parse(req.body);
   if (data.email === req.actor.email) throw new HttpError(409, 'Another administrator must manage your access.');
   // Lock in the same order as the authenticated mutation check.
@@ -348,6 +395,6 @@ api.put('/employees', mutate(async (req, client) => {
   await audit(client, req.actor.id, 'employee_access_configured', 'employee', user?.id || 'pending-enrollment');
 }));
 api.get('/audit', async (req, res) => {
-  role(req, 'admin');
+  role(req, ...adminRoles);
   res.json((await db.query('SELECT * FROM audit_events ORDER BY id DESC LIMIT 100')).rows);
 });

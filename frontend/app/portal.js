@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useState } from 'react';
 
 const labels = {
-  resident: 'Resident', staff: 'Barangay staff', approver: 'Authorized approver',
+  resident: 'Resident', staff: 'Barangay staff', approver: 'Barangay captain',
   treasurer: 'Treasurer', admin: 'Administrator', submitted: 'Submitted',
   under_review: 'Under review', awaiting_approval: 'Awaiting approval',
   needs_correction: 'Needs correction', approved: 'Approved', ready: 'Ready for pickup',
@@ -18,9 +18,10 @@ const manilaDate = () => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Mani
 const requestPath = id => '/requests/' + id;
 
 async function api(path, method = 'GET', body) {
+  const csv = body instanceof File;
   const response = await fetch('/api/v1' + path, {
     method, cache: 'no-store',
-    ...(body === undefined ? {} : { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
+    ...(body === undefined ? {} : { headers: { 'Content-Type': csv ? 'text/csv' : 'application/json' }, body: csv ? body : JSON.stringify(body) }),
   });
   const result = await response.json().catch(() => ({}));
   if (!response.ok) throw Object.assign(new Error(result.error || result.message || 'Unable to complete the request.'), { status: response.status });
@@ -141,7 +142,9 @@ function Filing({ staff, services, run }) {
   </section>;
 }
 
+const decisionActions = [['approve', 'Approve'], ['reject', 'Reject']];
 const staffActions = {
+  awaiting_approval: decisionActions,
   submitted: [['review', 'Begin review']],
   under_review: [['forward', 'Send for approval'], ['correct', 'Request correction'], ['reject-ineligible', 'Reject as ineligible']],
   approved: [['ready', 'Mark signed document ready']],
@@ -151,7 +154,7 @@ const staffActions = {
 function RequestCard({ request: r, role, slots, run }) {
   const path = requestPath(r.id);
   const staff = role === 'staff';
-  const actions = staff ? staffActions[r.status] || [] : role === 'approver' ? [['approve', 'Approve'], ['reject', 'Reject']] : [];
+  const actions = staff ? staffActions[r.status] || [] : role === 'approver' && r.status === 'awaiting_approval' ? decisionActions : [];
   return <details className="record">
     <summary><span><strong>{r.service}</strong><small>{r.applicant} · {time(r.created_at)}</small></span><span className="badge">{label(r.status)}</span></summary>
     <div className="record-body">
@@ -276,20 +279,166 @@ function Admin({ services, employees, audit, run }) {
   </>;
 }
 
-function Dashboard({ account }) {
+const csvTemplate = 'data:text/csv;charset=utf-8,name%2Ccontact_number%2Cage%2Csex%0D%0A';
+
+function ResidentRegistration({ run }) {
+  const [version, setVersion] = useState(0);
+  return <section className="card">
+    <h2>Register a resident</h2>
+    <Form key={version} submit="Register resident" onSubmit={async fields => {
+      await run('/residents', 'POST', fields, 'Resident registered.');
+      setVersion(value => value + 1);
+    }}>
+      <Field title="Full name" name="name" maxLength={120} />
+      <Field title="Contact number" name="contactNumber" type="tel" maxLength={40} />
+      <Field title="Age" name="age" type="number" min={0} max={130} />
+      <label>Sex<select name="sex" required defaultValue="">
+        <option value="" disabled>Select sex</option>
+        <option value="female">Female</option><option value="male">Male</option>
+        <option value="other">Other</option><option value="undisclosed">Undisclosed</option>
+      </select></label>
+    </Form>
+  </section>;
+}
+
+function ResidentImport() {
+  const [preview, setPreview] = useState(null);
+  const [receipt, setReceipt] = useState(null);
+  return <div className="stack">
+    <section className="card">
+      <h2>Upload a CSV file</h2>
+      <p><a href={csvTemplate} download="resident-import.csv">Download the CSV template</a></p>
+      <p className="muted">UTF-8 CSV, up to 5,000 residents and 2 MiB. Keep contact numbers formatted as text.</p>
+      <Form submit="Preview CSV" onSubmit={async ({ file }) => {
+        setPreview(null);
+        setReceipt(null);
+        if (!file?.size) throw new Error('Choose a CSV file.');
+        if (file.size > 2 * 1024 * 1024) throw new Error('The CSV exceeds 2 MiB.');
+        setPreview({ file, ...await api('/residents/import?mode=preview', 'POST', file) });
+      }}>
+        <label>Resident CSV<input name="file" type="file" accept=".csv,text/csv" required onChange={() => {
+          setPreview(null);
+          setReceipt(null);
+        }} /></label>
+      </Form>
+    </section>
+    {preview && <section className="card">
+      <h2>Import preview</h2>
+      <p>{preview.file.name}</p>
+      <p>{preview.ready} ready · {preview.duplicateRows.length} duplicates · {preview.errors.length} invalid</p>
+      {preview.errors.length > 0 && <details open>
+        <summary>Rows to correct</summary>
+        <ul className="import-rows">{preview.errors.map(({ row, message }) => <li key={row}>Row {row} · {message}</li>)}</ul>
+      </details>}
+      {preview.duplicateRows.length > 0 && <details>
+        <summary>Duplicate rows to skip</summary><p className="import-rows">{preview.duplicateRows.join(', ')}</p>
+      </details>}
+      {!preview.errors.length && preview.ready > 0 && <Form submit="Confirm import" onSubmit={async () => {
+        setReceipt(await api('/residents/import?mode=commit', 'POST', preview.file));
+        setPreview(null);
+      }} />}
+    </section>}
+    {receipt && <p className="notice" role="status">{receipt.inserted} residents imported. {receipt.duplicateRows.length} duplicate rows skipped.</p>}
+  </div>;
+}
+
+function Summary({ counts }) {
+  const metrics = [
+    ['Registered residents', counts.residents],
+    ['Pending document requests', counts.pending],
+    ['Resolved document requests', counts.resolved],
+  ];
+  return <section className="metrics" aria-label="Barangay totals">
+    {metrics.map(([title, value]) => <article key={title} className="card metric">
+      <h2>{title}</h2><p>{value.toLocaleString('en-PH')}</p>
+      {title === 'Resolved document requests' && <small>{counts.released} released · {counts.rejected} rejected</small>}
+    </article>)}
+  </section>;
+}
+
+const monthNames = Array.from({ length: 12 }, (_, index) => new Intl.DateTimeFormat('en-PH', {
+  month: 'short', timeZone: 'UTC',
+}).format(new Date(Date.UTC(2000, index, 1))));
+
+function ActivityTable({ title, columns, months, totals }) {
+  return <section className="card">
+    <h2>{title}</h2>
+    <table aria-label={title}>
+      <thead><tr><th scope="col">Month</th>{columns.map(column => <th key={column} scope="col">{column}</th>)}</tr></thead>
+      <tbody>{months.map((values, index) => <tr key={index}><th scope="row">{monthNames[index]}</th>
+        {values.map((value, col) => <td key={col}>{value}</td>)}</tr>)}</tbody>
+      <tfoot><tr><th scope="row">Total</th>{totals.map((value, col) => <td key={col}>{value}</td>)}</tr></tfoot>
+    </table>
+  </section>;
+}
+
+function YearlyReport({ data, setYear }) {
+  const requestColumns = ['Received', 'Released', 'Rejected'];
+  const requestValues = ({ received, released, rejected }) => [received, released, rejected];
+  const registrationValues = ({ walkIn, csv }) => [walkIn, csv];
+  return <div className="stack">
+    <section className="card">
+      <Form submit="View year" onSubmit={({ year }) => setYear(year)}>
+        <Field title="Calendar year (Manila)" name="year" type="number" defaultValue={data.year} min={1900} max={9998} />
+      </Form>
+    </section>
+    <h2 className="report-year">{data.year} service activity</h2>
+    <div className="report-tables">
+      {data.services.map(({ id, name }, index) => <ActivityTable key={id} title={name} columns={requestColumns}
+        months={data.months.map(month => requestValues(month.services[index]))} totals={requestValues(data.totals.services[index])} />)}
+      <ActivityTable title="Resident registrations" columns={['Walk-in', 'CSV import']}
+        months={data.months.map(month => registrationValues(month.registrations))} totals={registrationValues(data.totals.registrations)} />
+    </div>
+  </div>;
+}
+
+const employeeSections = {
+  admin: ['Dashboard', 'Yearly Reports', 'Import Residents', 'Administration'],
+  approver: ['Dashboard', 'Yearly Reports', 'Import Residents', 'Requests & Registration', 'Administration'],
+  staff: ['Dashboard', 'Requests & Registration', 'Counter & Pickup'],
+};
+
+function Workspace({ account }) {
+  const [section, setSection] = useState('Dashboard');
+  const [menuOpen, setMenuOpen] = useState(false);
+  const sections = employeeSections[account.role];
+  if (!sections) return <Dashboard account={account} />;
+  return <div className="workspace">
+    <aside className="workspace-sidebar">
+      <button type="button" className="secondary workspace-toggle" aria-expanded={menuOpen} aria-controls="workspace-navigation"
+        onClick={() => setMenuOpen(value => !value)}>{menuOpen ? 'Close menu' : 'Open menu'} <span>· {section}</span></button>
+      <nav aria-label="Employee workspace" id="workspace-navigation" className={menuOpen ? 'workspace-navigation open' : 'workspace-navigation'}>
+        {sections.map(item => <button type="button" key={item} aria-current={section === item ? 'page' : undefined}
+          onClick={() => { setSection(item); setMenuOpen(false); }}>{item}</button>)}
+      </nav>
+    </aside>
+    <Dashboard key={section} account={account} section={section} />
+  </div>;
+}
+
+function Dashboard({ account, section }) {
   const { role } = account;
+  const [year, setYear] = useState(() => manilaDate().slice(0, 4));
   const [data, setData] = useState(null);
   const [error, setError] = useState('');
   const [message, setMessage] = useState('');
   const [offset, setOffset] = useState(0);
   const refresh = useCallback(async () => {
-    const paths = role === 'admin' ? ['services', 'employees', 'audit'] :
-      role === 'resident' ? ['services', 'slots', 'notifications'] : role === 'staff' ? ['services', 'slots', 'counter'] : [];
-    const pairs = await Promise.all(paths.map(async path => [path, await api('/' + path)]));
-    if (role !== 'admin') pairs.push(['requests', await api('/requests?offset=' + offset)]);
+    const paths = {
+      Dashboard: ['dashboard'],
+      'Yearly Reports': ['reports/yearly?year=' + year],
+      Administration: ['services', 'employees', 'audit'],
+      'Requests & Registration': role === 'staff' ? ['services', 'slots'] : [],
+      'Counter & Pickup': ['slots', 'counter'],
+    }[section] || (role === 'resident' ? ['services', 'slots', 'notifications'] : []);
+    const needsRequests = !section || section === 'Requests & Registration';
+    const pairs = await Promise.all([
+      ...paths.map(async path => [path.split('?')[0], await api('/' + path)]),
+      ...(needsRequests ? [api('/requests?offset=' + offset).then(requests => ['requests', requests])] : []),
+    ]);
     setData(Object.fromEntries(pairs));
     setError('');
-  }, [role, offset]);
+  }, [role, offset, section, year]);
   useEffect(() => { refresh().catch(error => setError(error.message)); }, [refresh]);
   async function run(path, method, fields, success = 'Saved.') {
     setMessage('');
@@ -297,17 +446,23 @@ function Dashboard({ account }) {
     setMessage(success);
     try { await refresh(); } catch (error) { setError(error.message); }
   }
-  return <>
-    <div className="heading"><p className="eyebrow">{label(role)} workspace</p><h1>Welcome, {account.name}</h1>
-      <p>{role === 'resident' ? 'Manage your barangay document requests and pickup appointments.' : 'Manage barangay service work for your assigned role.'}</p>
-      <button className="secondary" onClick={() => refresh().catch(error => setError(error.message))}>Refresh dashboard</button>
+  return <div className="workspace-panel">
+    <div className="heading"><p className="eyebrow">{label(role)} workspace</p><h1>{section || 'Welcome, ' + account.name}</h1>
+      {section === 'Dashboard' && <p>Welcome, {account.name}</p>}
+      {!section && <p>{role === 'resident' ? 'Manage your barangay document requests and pickup appointments.' : 'Manage barangay service work for your assigned role.'}</p>}
+      {section !== 'Import Residents' && <button className="secondary" onClick={() => refresh().catch(error => setError(error.message))}>Refresh</button>}
     </div>
     {message && <p className="notice" role="status">{message}</p>}
     {error && <p className="error" role="alert">{error}</p>}
-    {!data && !error && <p role="status">Loading dashboard…</p>}
-    {data && <div className="dashboard">
+    {section === 'Import Residents' && <ResidentImport />}
+    {!data && !error && section !== 'Import Residents' && <p role="status">Loading…</p>}
+    {data?.dashboard && <Summary counts={data.dashboard} />}
+    {data?.['reports/yearly'] && <YearlyReport data={data['reports/yearly']} setYear={setYear} />}
+    {data?.employees && <div className="stack"><Admin {...data} run={run} /></div>}
+    {data?.counter && <div className="dashboard"><Counter counter={data.counter} slots={data.slots} run={run} /></div>}
+    {data?.requests && <div className="dashboard">
       <div className="stack">
-        {role === 'admin' ? <Admin {...data} run={run} /> : <section className="card">
+        <section className="card">
           <h2>{role === 'resident' ? 'Your requests' : 'Request worklist'}</h2>
           {!data.requests.length && <p>No requests on this page.</p>}
           {data.requests.map(r => <RequestCard key={r.id} request={r} role={role} slots={data.slots} run={run} />)}
@@ -315,21 +470,21 @@ function Dashboard({ account }) {
             {offset > 0 && <button className="secondary" onClick={() => setOffset(offset - 50)}>Previous</button>}
             {data.requests.length === 50 && <button className="secondary" onClick={() => setOffset(offset + 50)}>Next</button>}
           </div>
-        </section>}
-        {role === 'staff' && <Counter counter={data.counter} slots={data.slots} run={run} />}
+        </section>
       </div>
-      <aside className="stack">
+      {(role !== 'approver') && <aside className="stack">
+        {role === 'staff' && <ResidentRegistration run={run} />}
         {['resident','staff'].includes(role) && <Filing staff={role === 'staff'} services={data.services} run={run} />}
-        {role !== 'resident' && <Reports />}
+        {role === 'treasurer' && <Reports />}
         {role === 'resident' && <section className="card"><h2>Notifications</h2>
           {!data.notifications.length && <p>No notifications yet.</p>}
           {data.notifications.map(n => <div className="record-body" key={n.id}><strong>{n.message}</strong><small>{time(n.created_at)}</small>
             {!n.read_at && <Form submit="Mark read" onSubmit={() => run('/notifications/' + n.id + '/read', 'POST', {})} />}
           </div>)}
         </section>}
-      </aside>
+      </aside>}
     </div>}
-  </>;
+  </div>;
 }
 
 export default function Portal() {
@@ -350,7 +505,7 @@ export default function Portal() {
     <main>
       {error && <p className="error" role="alert">{error}</p>}
       {account === undefined ? <p role="status">Checking your session…</p> : account ? (
-        account.mfaRequired ? <Enrollment refresh={refresh} /> : <Dashboard account={account} />
+        account.mfaRequired ? <Enrollment refresh={refresh} /> : <Workspace key={account.id} account={account} />
       ) : <div className="welcome">
         <div><p className="eyebrow">Resident portal and staff services</p>
           <h1>Barangay documents and appointments</h1>
